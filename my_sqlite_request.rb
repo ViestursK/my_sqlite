@@ -11,10 +11,14 @@ class MySqliteRequest
     @insert_data = nil
     @update_data = nil
     @delete_flag = false
+    @debug_mode = false # Set to true to see debugging output
   end
 
   # Set the table name to query and validate if the file exists
   def from(table_name)
+    # Add .csv extension if not present
+    table_name = "#{table_name}.csv" unless table_name.end_with?('.csv')
+    
     if !File.exist?(table_name)
       raise "Error: Table '#{table_name}' not found."
     end
@@ -22,9 +26,16 @@ class MySqliteRequest
     self
   end
 
+  # Enable debug mode for verbose output
+  def debug(enable = true)
+    @debug_mode = enable
+    self
+  end
+
   # Specify which columns to select (can handle multiple columns as an array)
   def select(columns)
-    @select_columns = [columns].flatten
+    columns = [columns].flatten
+    @select_columns = columns
     self
   end
 
@@ -36,6 +47,9 @@ class MySqliteRequest
 
   # Define a JOIN operation between two tables based on specified columns
   def join(column_on_db_a, filename_db_b, column_on_db_b)
+    # Add .csv extension if not present
+    filename_db_b = "#{filename_db_b}.csv" unless filename_db_b.end_with?('.csv')
+    
     if !File.exist?(filename_db_b)
       raise "Error: Table '#{filename_db_b}' not found for join."
     end
@@ -102,6 +116,7 @@ class MySqliteRequest
     end
   rescue StandardError => e
     puts e.message
+    nil
   end
 
   private
@@ -109,20 +124,41 @@ class MySqliteRequest
   # Execute a SELECT query, applying where conditions, joins, and orders
   def execute_select
     data = read_table
+    return [] if data.empty?
+    
+    debug_log("Initial data rows: #{data.length}")
+    
     data = apply_where_conditions(data)
+    return [] if data.empty?
+    debug_log("After WHERE conditions: #{data.length} rows")
+    
     data = apply_join(data) if @join_data
+    return [] if data.empty?
+    debug_log("After JOIN: #{data.length} rows") if @join_data
+    
     data = apply_order(data) if @order_params
+    debug_log("After ORDER: #{data.length} rows") if @order_params
   
     if @select_columns.any?
-      # Debugging: Print available columns in the data
-      puts "Available columns in data: #{data.first.keys}"
-  
-      # Ensure all selected columns exist in the data
-      validate_columns(@select_columns, data.first.keys)
-      data.map! { |row| row.slice(*@select_columns) }
+      # Safe check for data.first existence
+      if data.empty?
+        return []
+      end
+      
+      debug_log("Available columns in data: #{data.first.keys}")
+      
+      # Handle wildcard * selection
+      if @select_columns.include?('*')
+        # Return all columns, no filtering needed
+        debug_log("Wildcard selection, returning all columns")
+      else
+        # Ensure all selected columns exist in the data
+        validate_columns(@select_columns, data.first.keys)
+        data.map! { |row| row.slice(*@select_columns) }
+      end
     end
   
-    puts "Final data: #{data}" # Debugging: Print the final data
+    debug_log("Final data rows: #{data.length}")
     data
   end
 
@@ -138,96 +174,185 @@ class MySqliteRequest
     end
   
     CSV.open(@table_name, 'a') { |csv| csv << headers.map { |h| @insert_data[h] } }
-    puts "Row inserted successfully."
+    debug_log("Row inserted successfully.")
+    { status: "success", message: "Row inserted successfully." }
   end
 
   # Execute an UPDATE query, modifying existing rows based on the where conditions
   def execute_update
     raise "Error: No update data provided." if @update_data.nil? || @update_data.empty?
   
+    # Read the table as CSV, headers as symbols
     data = CSV.table(@table_name)
-    validate_columns(@update_data.keys, data.headers.map(&:to_s))
+    
+    # Get the actual headers from the CSV file
+    available_columns = data.headers.map(&:to_s)
+    debug_log("Available columns: #{available_columns}")
+    
+    # Validate that update columns exist in the table
+    validate_columns(@update_data.keys, available_columns)
   
     updated_rows = 0
     data.each do |row|
-      if @where_conditions.all? { |cond| row[cond[:column].to_sym] == cond[:criteria] }
-        @update_data.each { |key, value| row[key.to_sym] = value }
+      if matches_conditions?(row)
+        @update_data.each do |key, value| 
+          row[key.to_sym] = value 
+        end
         updated_rows += 1
       end
     end
   
-    raise "Error: No rows matched the update criteria." if updated_rows.zero?
+    if updated_rows.zero?
+      puts "Warning: No rows matched the update criteria."
+      return { status: "warning", message: "No rows matched the update criteria." }
+    end
   
     File.write(@table_name, data.to_csv)
-    puts "#{updated_rows} rows updated."
+    debug_log("#{updated_rows} rows updated.")
+    { status: "success", message: "#{updated_rows} rows updated." }
   end 
 
   # Execute a DELETE query, removing rows based on the where conditions
   def execute_delete
-    data = CSV.table(@table_name)
-    initial_size = data.size
+    begin
+      data = CSV.table(@table_name)
+      initial_size = data.size
+      deleted_count = 0
 
-    data.delete_if do |row|
-      @where_conditions.all? { |cond| row[cond[:column].to_sym] == cond[:criteria] }
+      # Create a new table without the rows to delete
+      if @where_conditions.empty?
+        # Delete all rows if no conditions specified
+        data.delete_if { |_| true }
+        deleted_count = initial_size
+      else
+        # Use a standard array to track which rows to delete
+        rows_to_delete = []
+        
+        data.each.with_index do |row, idx|
+          if matches_conditions?(row)
+            rows_to_delete << idx
+            deleted_count += 1
+          end
+        end
+        
+        # Delete rows in reverse order to avoid index shifting problems
+        rows_to_delete.reverse_each do |idx|
+          data.delete(idx)
+        end
+      end
+
+      # Write the updated data back to the file
+      File.write(@table_name, data.to_csv)
+      
+      debug_log("#{deleted_count} rows deleted.")
+      
+      if deleted_count == 0
+        puts "Warning: No rows matched the delete criteria."
+        return { status: "warning", message: "No rows matched the delete criteria." }
+      else
+        return { status: "success", message: "#{deleted_count} rows deleted." }
+      end
+    rescue StandardError => e
+      puts "Error during DELETE operation: #{e.message}"
+      return { status: "error", message: e.message }
     end
+  end
 
-    File.write(@table_name, data.to_csv)
-    puts "#{initial_size - data.size} rows deleted."
+  # Check if a row matches all WHERE conditions
+  def matches_conditions?(row)
+    @where_conditions.all? do |cond|
+      row_value = row[cond[:column].to_sym]
+      # Simple string comparison for now, can be extended for more complex operators
+      row_value.to_s == cond[:criteria].to_s
+    end
   end
 
   # Apply WHERE conditions to the data (filter rows based on conditions)
   def apply_where_conditions(data)
     return data if @where_conditions.empty?
-
-  @where_conditions.each do |cond|
-    unless data.first.keys.include?(cond[:column])
-      raise "Error: Column '#{cond[:column]}' not found in the table."
-  end
-    data.select! { |row| row[cond[:column]] == cond[:criteria] }
-  end
-    data
-  end
-
-  def apply_where_conditions(data)
-    return data if @where_conditions.empty?
+    return [] if data.empty?
 
     @where_conditions.each do |cond|
-      unless data.first.keys.include?(cond[:column])
-        raise "Error: Column '#{cond[:column]}' not found in the table."
+      if data.first && !data.first.keys.include?(cond[:column])
+        puts "Error: Column '#{cond[:column]}' not found in the table."
+        return []
       end
-      data.select! { |row| row[cond[:column]] == cond[:criteria] }
+      
+      # Filter the data
+      data = data.select { |row| row[cond[:column]] == cond[:criteria] }
+      
+      # If no rows match, return empty array early
+      return [] if data.empty?
     end
     data
   end
 
   # Apply a JOIN operation on the data based on the join data provided
   def apply_join(data)
-    join_data = CSV.read(@join_data[:db_b_file], headers: true).map(&:to_h)
-    raise "Error: Table '#{@join_data[:db_b_file]}' is empty." if join_data.empty?
-  
-    db_a_column = @join_data[:db_a_column] # e.g., 'name'
-    db_b_column = @join_data[:db_b_column] # e.g., 'Player'
-  
-    unless data.first.keys.include?(db_a_column) && join_data.first.keys.include?(db_b_column)
-      raise "Error: Join column not found in one or both tables."
+    return [] if data.empty?
+    
+    begin
+      join_data = CSV.read(@join_data[:db_b_file], headers: true).map(&:to_h)
+      
+      if join_data.empty?
+        puts "Error: Table '#{@join_data[:db_b_file]}' is empty."
+        return []
+      end
+    
+      db_a_column = @join_data[:db_a_column] # e.g., 'name'
+      db_b_column = @join_data[:db_b_column] # e.g., 'Player'
+    
+      unless data.first.keys.include?(db_a_column)
+        puts "Error: Join column '#{db_a_column}' not found in first table."
+        return []
+      end
+      
+      unless join_data.first.keys.include?(db_b_column)
+        puts "Error: Join column '#{db_b_column}' not found in second table."
+        return []
+      end
+    
+      # Perform the join - using a more explicit approach for debugging
+      joined_data = []
+      
+      data.each do |row_a|
+        value_to_match = row_a[db_a_column]
+        matching_rows = join_data.select { |row_b| row_b[db_b_column] == value_to_match }
+        
+        if matching_rows.any?
+          matching_rows.each do |row_b|
+            joined_row = row_a.dup
+            row_b.each do |k, v|
+              joined_row[k] = v unless k == db_b_column && joined_row.key?(k)
+            end
+            joined_data << joined_row
+          end
+        else
+          # For INNER JOIN behavior (default), don't add non-matching rows
+          # For LEFT JOIN, you would uncomment: joined_data << row_a.dup
+        end
+      end
+    
+      # Debug: Print the join results
+      if @debug_mode
+        debug_log("Join from #{data.length} rows in table A with #{join_data.length} rows in table B")
+        debug_log("Resulted in #{joined_data.length} joined rows")
+        if joined_data.any?
+          debug_log("First joined row: #{joined_data.first}")
+          debug_log("Columns in joined data: #{joined_data.first.keys}")
+        end
+      end
+      
+      return joined_data
+    rescue StandardError => e
+      puts "Error during JOIN operation: #{e.message}"
+      return []
     end
-  
-    # Perform the join
-    joined_data = data.flat_map do |row|
-      join_data.select { |join_row| row[db_a_column] == join_row[db_b_column] }
-               .map { |join_row| row.merge(join_row) }
-    end
-  
-    # Debugging: Print the first joined row to verify columns
-    if joined_data.any?
-      puts "First joined row: #{joined_data.first}"
-      puts "Columns in joined data: #{joined_data.first.keys}"
-    end  
-    joined_data
   end
 
   # Apply the ORDER BY operation to the data based on the specified column and order
   def apply_order(data)
+    return data if data.empty?
     validate_columns([@order_params[:column]], data.first.keys)
 
     # Store original height values before sorting them numerically
@@ -243,21 +368,17 @@ class MySqliteRequest
     data.reverse! if @order_params[:order] == :desc
 
     # Convert height back to its original format after sorting
-    data.each do |row|
-      row['height'] = numeric_to_height(row['height'])
+    if @order_params[:column] == 'height'
+      data.each do |row|
+        row['height'] = row['original_height']
+        row.delete('original_height')
+      end
     end
 
     data
   end
 
-  # Helper method to convert numeric height back to feet-inches format
-  def numeric_to_height(height_in_inches)
-    feet = height_in_inches / 12
-    inches = height_in_inches % 12
-    "#{feet}-#{inches}"
-  end
-
-  # Helper method to convert height (e.g., '6-3') to inches
+  # Helper method to convert height (e.g., '6-3') to inches for sorting
   def height_to_numeric(height)
     if height.is_a?(String) && height.include?('-')
       feet, inches = height.split('-').map(&:to_i)
@@ -286,136 +407,17 @@ class MySqliteRequest
     columns = columns.map(&:to_s)
     available_columns = available_columns.compact.map(&:to_s) # Remove nil keys
   
+    # Skip validation for wildcard
+    return true if columns.include?('*')
+    
     missing_columns = columns - available_columns
     unless missing_columns.empty?
       raise "Error: Columns not found in table: #{missing_columns.join(', ')}."
     end
   end
+
+  # Print debug information if debug mode is enabled
+  def debug_log(message)
+    puts "DEBUG: #{message}" if @debug_mode
+  end
 end
-
-# __________
-# TESTS 
-
-# def test_insert
-#     puts "Test 1: Insert a new row"
-#     MySqliteRequest.new.insert('nba_player_data_copy.csv').values({
-#       'name' => 'John Doe',
-#       'year_start' => '2024',
-#       'year_end' => '2026',
-#       'position' => 'G',
-#       'height' => '6-5',
-#       'weight' => '210',
-#       'birth_date' => 'March 14, 2000',
-#       'college' => 'Duke University'
-#     }).run
-#     puts "Inserted new player: John Doe\n\n"
-#   end
-  
-#   def test_select
-#     puts "Test 2: Select rows based on conditions"
-#     result = MySqliteRequest.new.from('nba_player_data_copy.csv')
-#                               .select(['name', 'position', 'college'])
-#                               .where('college', 'Duke University')
-#                               .run
-#     puts "Selected data from Duke University: #{result.inspect}\n\n"
-#   end
-  
-#   def test_update
-#     puts "Test 3: Update a player's position"
-#     MySqliteRequest.new.from('nba_player_data_copy.csv')
-#       .update('nba_player_data_copy.csv')
-#       .where('name', 'John Doe')
-#       .set({ 'position' => 'PG' })
-#       .run
-  
-#     # Check the updated player
-#     result = MySqliteRequest.new.from('nba_player_data_copy.csv')
-#                               .select(['name', 'position'])
-#                               .where('name', 'John Doe')
-#                               .run
-#     puts "Updated player: #{result.inspect}\n\n"
-#   end
-  
-#   def test_delete
-#     puts "Test 4: Delete a player"
-#     MySqliteRequest.new.from('nba_player_data_copy.csv')
-#       .delete
-#       .where('name', 'John Doe')
-#       .run
-#     puts "Deleted player: John Doe\n\n"
-#   end
-  
-# def test_join
-#   puts "Test 5: Join two tables"
-#   result = MySqliteRequest.new.from('nba_player_data_copy.csv')
-#                             .join('name', 'nba_players.csv', 'Player')
-#                             .select(['name', 'college'])
-#                             .where('college', 'Duke University')
-#                             .run
-#   puts "Joined data: #{result.inspect}\n\n"
-# end
-    
-#   def test_order
-#     puts "Test 6: Apply ORDER BY (height desc)"
-#     result = MySqliteRequest.new.from('nba_player_data_copy.csv')
-#                               .select(['name', 'height'])
-#                               .order(:asc, 'height')
-#                               .run
-#     puts "Ordered by height (desc): #{result.inspect}\n\n"
-#   end
-  
-#   def test_multiple_operations
-#     puts "Test 7: Combined operations (Insert, Select, Update, Delete)"
-  
-#     # Insert new player
-#     MySqliteRequest.new.insert('nba_player_data_copy.csv').values({
-#       'name' => 'Test Player',
-#       'year_start' => '2024',
-#       'year_end' => '2025',
-#       'position' => 'G',
-#       'height' => '6-3',
-#       'weight' => '190',
-#       'birth_date' => 'January 1, 2000',
-#       'college' => 'Test University'
-#     }).run
-#     puts "Inserted new player: Test Player\n"
-  
-#     # Select inserted player
-#     result = MySqliteRequest.new.from('nba_player_data_copy.csv')
-#                               .select(['name', 'college'])
-#                               .where('name', 'Test Player')
-#                               .run
-#     puts "Selected player: #{result.inspect}\n"
-  
-#     # Update player's position
-#     MySqliteRequest.new.from('nba_player_data_copy.csv')
-#       .update('nba_player_data_copy.csv')
-#       .where('name', 'Test Player')
-#       .set({ 'position' => 'SG' })
-#       .run
-#     puts "Updated player's position to SG.\n"
-  
-#     # Check the updated player
-#     updated_result = MySqliteRequest.new.from('nba_player_data_copy.csv')
-#                                       .select(['name', 'position'])
-#                                       .where('name', 'Test Player')
-#                                       .run
-#     puts "Updated player data: #{updated_result.inspect}\n"
-  
-#     # Delete the player (optional)
-#     MySqliteRequest.new.from('nba_player_data_copy.csv')
-#       .delete
-#       .where('name', 'Test Player')
-#       .run
-#     puts "Deleted player: Test Player\n\n"
-#   end
-
-  
-#   # Run all test cases
-#   test_insert
-#   test_select
-#   test_update
-#   test_delete
-#   test_join
-#   test_order
-#   test_multiple_operations
